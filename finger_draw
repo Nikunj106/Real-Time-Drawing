@@ -1,0 +1,378 @@
+"""
+Finger Draw App — Just press Run, nothing else needed!
+======================================================
+This script auto-installs all required packages and
+downloads the hand model on first run.
+
+Gestures (RIGHT hand):
+  ☝  Index finger up, thumb NOT touching  →  DRAW
+  👌  Pinch (thumb near index tip)         →  HOVER / pause
+  🖐  All 5 fingers open                   →  ERASE everything
+
+UI:
+  Top bar         [CAM]  [BLACK]  [WHITE]  — point to switch canvas
+  Left side       colour palette           — point to pick colour
+  Right side      vertical slider          — drag for brush size
+  +/- keys                                 — brush size
+  Q                                        — quit
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTO INSTALL — runs silently before anything else
+# ═══════════════════════════════════════════════════════════════════════════════
+import subprocess, sys, importlib
+
+def install(pkg, import_name=None):
+    name = import_name or pkg
+    try:
+        importlib.import_module(name)
+    except ImportError:
+        print(f"Installing {pkg}…")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", pkg],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        print(f"{pkg} installed.")
+
+install("opencv-python", "cv2")
+install("mediapipe")
+install("numpy")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  IMPORTS
+# ═══════════════════════════════════════════════════════════════════════════════
+import cv2
+import numpy as np
+import math
+import os
+import urllib.request
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import HandLandmarkerOptions
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTO DOWNLOAD MODEL
+# ═══════════════════════════════════════════════════════════════════════════════
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+MODEL_URL  = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+)
+if not os.path.exists(MODEL_PATH):
+    print("Downloading hand model (~8 MB) — only needed once…")
+    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    print("Model ready.\n")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+PINCH_THRESH  = 0.055
+ERASE_COUNT   = 5
+MIN_BRUSH     = 2
+MAX_BRUSH     = 40
+DEFAULT_BRUSH = 8
+WIN_SCALE     = 1.12      # window 12 % bigger than camera feed
+
+COLORS = [
+    ("Red",    (0,   0,   255)),
+    ("Orange", (0,  128,  255)),
+    ("Yellow", (0,  215,  215)),
+    ("Green",  (0,  200,    0)),
+    ("Cyan",   (255,200,    0)),
+    ("Blue",   (255,  0,    0)),
+    ("Purple", (160,  0,  160)),
+    ("Pink",   (130,  0,  255)),
+    ("White",  (255,255,  255)),
+    ("Black",  (0,    0,    0)),
+]
+N_COLORS = len(COLORS)
+
+HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (0,9),(9,10),(10,11),(11,12),
+    (0,13),(13,14),(14,15),(15,16),
+    (0,17),(17,18),(18,19),(19,20),
+    (5,9),(9,13),(13,17),
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HAND LANDMARKER
+# ═══════════════════════════════════════════════════════════════════════════════
+base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+options = HandLandmarkerOptions(
+    base_options=base_options,
+    num_hands=1,
+    min_hand_detection_confidence=0.70,
+    min_hand_presence_confidence=0.70,
+    min_tracking_confidence=0.60,
+    running_mode=mp_vision.RunningMode.IMAGE,
+)
+landmarker = mp_vision.HandLandmarker.create_from_options(options)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CAMERA
+# ═══════════════════════════════════════════════════════════════════════════════
+cap = cv2.VideoCapture(0)
+ret, frm = cap.read()
+if not ret:
+    raise RuntimeError("Cannot open webcam.")
+H, W = frm.shape[:2]
+
+DISP_W = int(W * WIN_SCALE)
+DISP_H = int(H * WIN_SCALE)
+
+canvas = np.zeros((H, W, 3), dtype=np.uint8)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UI GEOMETRY
+# ═══════════════════════════════════════════════════════════════════════════════
+TOP_H   = 56          # top bar height
+BTN_W   = W // 3      # each canvas-mode button width
+
+# ── Left palette (vertical strip) ────────────────────────────────────────────
+PAL_W    = 72          # width of the palette column
+SWATCH_H = (H - TOP_H) // N_COLORS   # height of each colour swatch
+
+# ── Right brush slider ───────────────────────────────────────────────────────
+SL_CX    = W - 36
+SL_TOP   = TOP_H + 28
+SL_BOT   = H - 28
+SL_H     = SL_BOT - SL_TOP
+SL_ZONE  = 54          # horizontal grab zone width
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  APP STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+mode_idx    = 0
+color_idx   = 0
+brush       = DEFAULT_BRUSH
+prev_pt     = None
+drawing     = False
+drag_slider = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def norm_dist(a, b):
+    return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
+
+def fingers_up(lm):
+    tips   = [4,  8, 12, 16, 20]
+    joints = [3,  6, 10, 14, 18]
+    up = [lm[tips[0]].x < lm[joints[0]].x]
+    for i in range(1, 5):
+        up.append(lm[tips[i]].y < lm[joints[i]].y)
+    return up
+
+def in_rect(px, py, x0, y0, x1, y1):
+    return x0 <= px <= x1 and y0 <= py <= y1
+
+def brush_from_y(py):
+    frac = 1.0 - max(0.0, min(1.0, (py - SL_TOP) / SL_H))
+    return int(round(MIN_BRUSH + frac * (MAX_BRUSH - MIN_BRUSH)))
+
+def knob_y(b):
+    frac = (b - MIN_BRUSH) / (MAX_BRUSH - MIN_BRUSH)
+    return int(SL_BOT - frac * SL_H)
+
+def draw_skeleton(img, landmarks):
+    for (a, b) in HAND_CONNECTIONS:
+        x1, y1 = int(landmarks[a].x * W), int(landmarks[a].y * H)
+        x2, y2 = int(landmarks[b].x * W), int(landmarks[b].y * H)
+        cv2.line(img, (x1,y1), (x2,y2), (255,255,255), 2)
+    for lm in landmarks:
+        cx, cy = int(lm.x * W), int(lm.y * H)
+        cv2.circle(img, (cx,cy), 4, (0,255,0), -1)
+
+def compose_bg(frame, canvas_layer, mode):
+    if   mode == 0: bg = frame.copy()
+    elif mode == 1: bg = np.zeros((H, W, 3), dtype=np.uint8)
+    else:           bg = np.full((H, W, 3), 255, dtype=np.uint8)
+    gray    = cv2.cvtColor(canvas_layer, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+    mask3   = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    return np.where(mask3 > 0, canvas_layer, bg)
+
+def draw_ui(img, mode, col_idx, brush_sz, is_drawing, fpt):
+    out = img.copy()
+
+    # ── Top bar ───────────────────────────────────────────────────────────
+    labels = ["[CAM]", "[BLACK]", "[WHITE]"]
+    for i, lbl in enumerate(labels):
+        x0  = i * BTN_W
+        col = (30,144,255) if i == mode else (45,45,45)
+        cv2.rectangle(out, (x0, 0), (x0 + BTN_W - 2, TOP_H - 2), col, -1)
+        cv2.rectangle(out, (x0, 0), (x0 + BTN_W - 2, TOP_H - 2), (160,160,160), 1)
+        (tw, _), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.putText(out, lbl, (x0 + (BTN_W - tw)//2, TOP_H - 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+    # ── Status (top-right area, avoids slider) ────────────────────────────
+    status = "DRAW" if is_drawing else "HOVER"
+    sc     = (0,255,120) if is_drawing else (0,200,255)
+    cv2.putText(out, status, (PAL_W + 10, TOP_H + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, sc, 2)
+
+    # ── Left colour palette (vertical) ───────────────────────────────────
+    # Dark background panel
+    cv2.rectangle(out, (0, TOP_H), (PAL_W, H), (30,30,30), -1)
+    cv2.line(out, (PAL_W, TOP_H), (PAL_W, H), (100,100,100), 2)
+
+    for i, (name, bgr) in enumerate(COLORS):
+        y0 = TOP_H + i * SWATCH_H
+        y1 = y0 + SWATCH_H - 2
+
+        # Swatch fill
+        cv2.rectangle(out, (2, y0), (PAL_W - 4, y1), bgr, -1)
+
+        # Active highlight
+        if i == col_idx:
+            cv2.rectangle(out, (2, y0), (PAL_W - 4, y1), (255,255,255), 3)
+            cv2.rectangle(out, (5, y0+3), (PAL_W - 7, y1-3), (0,0,0), 1)
+
+        # Colour name — rotated feel via short label, contrasting colour
+        brightness = 0.114*bgr[0] + 0.587*bgr[1] + 0.299*bgr[2]
+        txt_col    = (0,0,0) if brightness > 140 else (255,255,255)
+        short      = name[:3]   # "Red", "Ora", "Yel" … fits the narrow strip
+        (tw, th), _ = cv2.getTextSize(short, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+        tx = (PAL_W - tw) // 2
+        ty = y0 + (SWATCH_H + th) // 2
+        cv2.putText(out, short, (tx, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, txt_col, 1, cv2.LINE_AA)
+
+    # ── Right brush slider ────────────────────────────────────────────────
+    ky = knob_y(brush_sz)
+    cv2.line(out, (SL_CX, SL_TOP), (SL_CX, SL_BOT), (70,70,70), 5)
+    cv2.line(out, (SL_CX, ky),     (SL_CX, SL_BOT), (30,144,255), 5)
+    cv2.circle(out, (SL_CX, ky), 14, (30,144,255), -1)
+    cv2.circle(out, (SL_CX, ky), 14, (255,255,255),  2)
+    cv2.putText(out, f"{brush_sz}px", (SL_CX - 30, SL_TOP - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
+    cv2.putText(out, "SIZE", (SL_CX - 22, SL_BOT + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140,140,140), 1)
+
+    # ── Current colour chip above slider ─────────────────────────────────
+    cv2.rectangle(out, (SL_CX-22, TOP_H+6), (SL_CX+6, TOP_H+48),
+                  COLORS[col_idx][1], -1)
+    cv2.rectangle(out, (SL_CX-22, TOP_H+6), (SL_CX+6, TOP_H+48),
+                  (200,200,200), 2)
+
+    # ── Fingertip cursor ──────────────────────────────────────────────────
+    if fpt:
+        ring = (0,255,120) if is_drawing else (0,200,255)
+        r    = max(5, brush_sz // 2)
+        cv2.circle(out, fpt, r+5, ring,                2)
+        cv2.circle(out, fpt, r,   COLORS[col_idx][1], -1)
+
+    return out
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n=== Finger Draw ===  Q to quit")
+print("  ☝  Index up (thumb away) = DRAW")
+print("  👌  Pinch                 = HOVER")
+print("  🖐  All 5 fingers         = ERASE")
+print("  Left palette             = pick colour")
+print("  Right slider             = brush size")
+print("  Top bar                  = switch canvas (CAM / BLACK / WHITE)")
+print("  +/- keys                 = brush size\n")
+
+WIN_NAME = "Finger Draw  |  Q = quit"
+cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(WIN_NAME, DISP_W, DISP_H)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame     = cv2.flip(frame, 1)
+    finger_pt = None
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                        data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    result   = landmarker.detect(mp_image)
+
+    if result.hand_landmarks:
+        lm = result.hand_landmarks[0]
+        draw_skeleton(frame, lm)
+
+        up    = fingers_up(lm)
+        total = sum(up)
+
+        # ── Erase ──────────────────────────────────────────────────────────
+        if total >= ERASE_COUNT:
+            canvas[:]   = 0
+            prev_pt     = None
+            drawing     = False
+            drag_slider = False
+
+        elif up[1]:
+            ix = int(lm[8].x * W)
+            iy = int(lm[8].y * H)
+            finger_pt = (ix, iy)
+
+            pinching = norm_dist(lm[4], lm[8]) < PINCH_THRESH
+            drawing  = not pinching
+
+            # ── Right slider ───────────────────────────────────────────────
+            if drag_slider or in_rect(ix, iy, W-SL_ZONE, SL_TOP, W, SL_BOT):
+                drag_slider = True
+                brush       = brush_from_y(iy)
+                prev_pt     = None
+                drawing     = False
+                if not in_rect(ix, iy, W-SL_ZONE-20, SL_TOP-20, W, SL_BOT+20):
+                    drag_slider = False
+
+            # ── Top bar ────────────────────────────────────────────────────
+            elif in_rect(ix, iy, 0, 0, W, TOP_H):
+                mode_idx = min(ix // BTN_W, 2)
+                prev_pt  = None
+                drawing  = False
+
+            # ── Left palette ───────────────────────────────────────────────
+            elif in_rect(ix, iy, 0, TOP_H, PAL_W, H):
+                idx       = (iy - TOP_H) // SWATCH_H
+                color_idx = max(0, min(N_COLORS - 1, idx))
+                prev_pt   = None
+                drawing   = False
+
+            # ── Draw (avoid palette & slider columns) ─────────────────────
+            elif drawing and ix > PAL_W and ix < W - SL_ZONE:
+                if prev_pt is not None:
+                    cv2.line(canvas, prev_pt, finger_pt,
+                             COLORS[color_idx][1], brush)
+                prev_pt = finger_pt
+            else:
+                prev_pt = None
+
+        else:
+            prev_pt     = None
+            drawing     = False
+            drag_slider = False
+
+    else:
+        prev_pt     = None
+        drawing     = False
+        drag_slider = False
+
+    # ── Render ────────────────────────────────────────────────────────────
+    bg      = compose_bg(frame, canvas, mode_idx)
+    display = draw_ui(bg, mode_idx, color_idx, brush, drawing, finger_pt)
+    display = cv2.resize(display, (DISP_W, DISP_H), interpolation=cv2.INTER_LINEAR)
+
+    cv2.imshow(WIN_NAME, display)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key in (ord('+'), ord('=')):
+        brush = min(brush + 2, MAX_BRUSH)
+    elif key == ord('-'):
+        brush = max(brush - 2, MIN_BRUSH)
+
+cap.release()
+cv2.destroyAllWindows()
+landmarker.close()
